@@ -2,26 +2,43 @@ import { useState, useEffect } from "react";
 import ItemForm from "./ItemForm";
 import CategorizedItems from "./CategorizedItems";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, Loader2 } from "lucide-react";
 
-const CreateTab = ({ setCategorizedData, initialData }) => {
+const CreateTab = ({ setCategorizedData }) => {
   const [localData, setLocalData] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Initialize local data from initialData
+  // Load existing data on component mount
   useEffect(() => {
-    if (initialData) {
-      setLocalData(initialData);
-    }
-  }, [initialData]);
+    const fetchStoredData = async () => {
+      try {
+        const response = await fetch("/api/stored-data");
+        if (!response.ok) {
+          throw new Error("Failed to fetch stored data");
+        }
+        const data = await response.json();
+        setLocalData(data);
+        setCategorizedData(data);
+      } catch (err) {
+        console.error("Error fetching initial data:", err);
+        setError("Failed to load existing items. Please try again.");
+      } finally {
+        setInitialLoading(false);
+      }
+    };
+
+    fetchStoredData();
+  }, [setCategorizedData]);
 
   const handleSubmitItems = async (items) => {
     setIsLoading(true);
     setError(null);
 
     try {
-      const response = await fetch("http://127.0.0.1:5000/categorize-items", {
+      // Send items to backend for categorization
+      const response = await fetch("/api/categorize-items", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -30,19 +47,34 @@ const CreateTab = ({ setCategorizedData, initialData }) => {
       });
 
       if (!response.ok) {
-        throw new Error("Failed to categorize items");
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to categorize items");
       }
 
-      const data = await response.json();
-      setLocalData(data);
-      setCategorizedData(data);
+      // Process the categorized data from the backend
+      const categorizedData = await response.json();
+
+      // Update local state and parent component state
+      setLocalData(categorizedData);
+      setCategorizedData(categorizedData);
     } catch (err) {
-      setError(err.message);
-      console.error("Error categorizing items:", err);
+      setError(
+        err.message || "Something went wrong with the categorization process"
+      );
+      console.error("Categorization error:", err);
     } finally {
       setIsLoading(false);
     }
   };
+
+  if (initialLoading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-12 space-y-4">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        <p className="text-muted-foreground">Loading existing items...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-8">
@@ -56,7 +88,8 @@ const CreateTab = ({ setCategorizedData, initialData }) => {
 
       <ItemForm onSubmit={handleSubmitItems} isLoading={isLoading} />
 
-      <CategorizedItems data={localData} />
+      {/* Pass isLoading to CategorizedItems to show loading state */}
+      <CategorizedItems data={localData} isLoading={isLoading} />
     </div>
   );
 };

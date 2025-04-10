@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -9,18 +9,60 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Loader2 } from "lucide-react";
+import { useToast } from "@/components/ui/use-toast";
 
 const ItemForm = ({ onSubmit, isLoading }) => {
   const [items, setItems] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [isFetchingSuggestions, setIsFetchingSuggestions] = useState(false);
+  const { toast } = useToast();
 
+  // Examples based on common categorizable items
   const examples = [
     "bread, water, apple",
     "toothbrush, soap, towel",
     "notebook, pen, glasses",
   ];
 
-  const handleSubmit = (e) => {
+  // Fetch suggestion data from MongoDB when component mounts
+  useEffect(() => {
+    const fetchSuggestions = async () => {
+      setIsFetchingSuggestions(true);
+      try {
+        const response = await fetch("/api/item-suggestions");
+        if (!response.ok) {
+          throw new Error("Failed to fetch suggestions");
+        }
+        const data = await response.json();
+
+        // Extract common categories from existing items
+        if (data && data.categories) {
+          setSuggestions(data.categories.slice(0, 5)); // Limit to 5 suggestions
+        }
+      } catch (error) {
+        console.error("Error fetching item suggestions:", error);
+        // Silently fail for suggestions as they're not critical
+      } finally {
+        setIsFetchingSuggestions(false);
+      }
+    };
+
+    fetchSuggestions();
+  }, []);
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
+
+    if (!items.trim()) {
+      toast({
+        title: "No items provided",
+        description: "Please enter at least one item to categorize",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Pass items to parent component for processing by the backend
     onSubmit(items);
   };
 
@@ -34,7 +76,7 @@ const ItemForm = ({ onSubmit, isLoading }) => {
         <CardTitle className="text-2xl">Add New Items</CardTitle>
         <CardDescription>
           Enter items to categorize and generate common requests. Previously
-          added items will be preserved.
+          added items will be preserved and updated with the Qwen model.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -47,7 +89,7 @@ const ItemForm = ({ onSubmit, isLoading }) => {
               id="items"
               value={items}
               onChange={(e) => setItems(e.target.value)}
-              placeholder="bread, water, apple, toothpaste"
+              placeholder="bread, water, ..."
               className="h-12"
               required
             />
@@ -67,18 +109,44 @@ const ItemForm = ({ onSubmit, isLoading }) => {
                 ))}
               </div>
             </div>
+
+            {suggestions.length > 0 && (
+              <div className="pt-2">
+                <p className="text-xs text-muted-foreground mb-2">
+                  Popular categories:
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {suggestions.map((suggestion, index) => (
+                    <span
+                      key={index}
+                      className="text-xs bg-primary/10 text-primary px-2 py-1 rounded"
+                    >
+                      {suggestion}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <Button type="submit" disabled={isLoading} className="w-full h-12">
             {isLoading ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Processing...
+                {/* Show more detailed status during processing */}
+                Categorizing with Qwen AI...
               </>
             ) : (
               "Categorize Items"
             )}
           </Button>
+
+          {isLoading && (
+            <p className="text-xs text-center text-muted-foreground">
+              Generating images and videos using Wan2.1 models. This may take a
+              moment...
+            </p>
+          )}
         </form>
       </CardContent>
     </Card>
