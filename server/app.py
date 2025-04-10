@@ -13,6 +13,10 @@ from pymongo import MongoClient
 from botocore.exceptions import ClientError
 import oss2
 from openai import OpenAI
+from aliyunsdkcore.client import AcsClient
+from aliyunsdkcore.acs_exception.exceptions import ClientException, ServerException
+from aliyunsdknls.request.v20180628 import CreateTtsTaskRequest
+
 
 app = Flask(__name__)
 CORS(app)
@@ -58,6 +62,13 @@ os.makedirs(IMAGES_DIR, exist_ok=True)
 # Wan2.1 model paths
 WAN_T2I_MODEL_PATH = os.getenv("WAN_T2I_MODEL_PATH", "./Wan2.1-T2V-1.3B")
 WAN_I2V_MODEL_PATH = os.getenv("WAN_I2V_MODEL_PATH", "./Wan2.1-I2V-1.3B-720P")
+
+# Initialize Alibaba Intelligent Speech client
+speech_client = AcsClient(
+    os.getenv("ALIBABA_SPEECH_ACCESS_KEY_ID"),
+    os.getenv("ALIBABA_SPEECH_ACCESS_KEY_SECRET"),
+    os.getenv("ALIBABA_SPEECH_REGION", "ap-southeast-1")
+)
 
 
 class TaskStatus:
@@ -152,6 +163,63 @@ def generate_and_save_image(prompt, filename):
 
     except Exception as e:
         print(f"Error generating image for {prompt}: {str(e)}")
+        return None
+
+
+def generate_tts_audio(text, voice="Olivia", filename=None):
+    """Generate speech audio from text using Alibaba Intelligent Speech Interaction"""
+    try:
+        if not filename:
+            # Generate a unique filename based on text
+            filename = f"speech_{text.replace(' ', '_')[:30].lower()}_{int(time.time())}.mp3"
+
+        # Local audio path
+        local_audio_path = os.path.join(TEMP_DIR, 'audio', filename)
+        os.makedirs(os.path.join(TEMP_DIR, 'audio'), exist_ok=True)
+
+        # Create TTS request
+        request = CreateTtsTaskRequest.CreateTtsTaskRequest()
+        request.set_accept_format('json')
+        request.set_Text(text)
+        request.set_Voice(voice)  # Voice options like Olivia, William, etc.
+        request.set_Format("mp3")
+        request.set_SampleRate(16000)
+
+        # Execute request
+        response = speech_client.do_action_with_exception(request)
+        response_json = json.loads(response)
+
+        if 'TaskId' in response_json:
+            task_id = response_json['TaskId']
+
+            # Wait for task completion and download the audio file
+            status = "RUNNING"
+            while status == "RUNNING":
+                time.sleep(1)
+                status_request = GetTtsTaskRequest.GetTtsTaskRequest()
+                status_request.set_TaskId(task_id)
+                status_response = speech_client.do_action_with_exception(
+                    status_request)
+                status_response_json = json.loads(status_response)
+                status = status_response_json.get('StatusText', 'RUNNING')
+
+            if status == "SUCCESS" and 'TtsUrl' in status_response_json:
+                # Download the audio file
+                urllib.request.urlretrieve(
+                    status_response_json['TtsUrl'], local_audio_path)
+
+                # Upload to OSS
+                oss_key = f"audio/{filename}"
+                upload_file_to_oss(local_audio_path, oss_key)
+                return oss_key
+            else:
+                print(f"TTS task failed with status: {status}")
+                return None
+        else:
+            print("Failed to create TTS task")
+            return None
+    except Exception as e:
+        print(f"Error generating audio: {str(e)}")
         return None
 
 
@@ -352,6 +420,33 @@ def categorize_items():
             "images": image_mapping
         }
 
+        # Process categories, subcategories, and items for TTS
+        audio_mapping = {}
+
+        # Generate audio for categories
+        for category in categories:
+            audio_key = generate_tts_audio(category)
+            if audio_key:
+                audio_mapping[category] = audio_key
+
+        # Generate audio for subcategories
+        for subcategory_full in subcategories:
+            parts = subcategory_full.split('-', 1)
+            if len(parts) == 2:
+                _, subcategory = parts
+                audio_key = generate_tts_audio(subcategory)
+                if audio_key:
+                    audio_mapping[subcategory] = audio_key
+
+        # Generate audio for items
+        for item in parsed["items"]:
+            audio_key = generate_tts_audio(item["name"])
+            if audio_key:
+                audio_mapping[item["name"]] = audio_key
+
+        # Add audio to final response
+        final_data["audio"] = audio_mapping
+
         # Save the updated data to MongoDB
         save_data_to_mongodb(final_data)
 
@@ -411,6 +506,54 @@ def get_image(filename):
     except Exception as e:
         print(f"Error serving image: {str(e)}")
         return jsonify({"error": str(e)}), 404
+
+
+@app.route('/api/audio/<path:filename>', methods=['GET'])
+def get_audio(filename):
+    try:
+        # Check if file exists in OSS and return signed URL
+        oss_key = f"audio/{filename}"
+        url = bucket.sign_url('GET', oss_key, 3600)  # 1-hour link
+        return jsonify({"url": url})
+    except Exception as e:
+        print(f"Error serving audio: {str(e)}")
+        return jsonify({"error": str(e)}), 404
+
+
+@app.route('/api/generate-speech', methods=['POST'])
+def generate_speech():
+    try:
+        data = request.json
+        text = data.get('text')
+        voice = data.get('voice', 'Olivia')
+
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+
+        # Generate a deterministic filename based on text content
+        sanitized_text = text.replace(' ', '_').lower()
+        filename = f"{sanitized_text[:30]}_{hash(text) % 10000}.mp3"
+
+        # Check if this audio already exists in OSS
+        oss_key = f"audio/{filename}"
+        try:
+            bucket.get_object_meta(oss_key)
+            print(f"Audio already exists in OSS for '{text}'")
+        except:
+            # Generate new audio
+            print(f"Generating audio for: '{text}'")
+            oss_key = generate_tts_audio(text, voice, filename)
+
+            if not oss_key:
+                return jsonify({"error": "Failed to generate audio"}), 500
+
+        # Get signed URL
+        url = bucket.sign_url('GET', oss_key, 3600)  # 1-hour link
+        return jsonify({"url": url, "key": oss_key})
+
+    except Exception as e:
+        print(f"Error generating speech: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':

@@ -24,32 +24,6 @@ const ItemForm = ({ onSubmit, isLoading }) => {
     "notebook, pen, glasses",
   ];
 
-  // Fetch suggestion data from MongoDB when component mounts
-  useEffect(() => {
-    const fetchSuggestions = async () => {
-      setIsFetchingSuggestions(true);
-      try {
-        const response = await fetch("/api/item-suggestions");
-        if (!response.ok) {
-          throw new Error("Failed to fetch suggestions");
-        }
-        const data = await response.json();
-
-        // Extract common categories from existing items
-        if (data && data.categories) {
-          setSuggestions(data.categories.slice(0, 5)); // Limit to 5 suggestions
-        }
-      } catch (error) {
-        console.error("Error fetching item suggestions:", error);
-        // Silently fail for suggestions as they're not critical
-      } finally {
-        setIsFetchingSuggestions(false);
-      }
-    };
-
-    fetchSuggestions();
-  }, []);
-
   const handleSubmit = async (e) => {
     e.preventDefault();
 
@@ -109,24 +83,6 @@ const ItemForm = ({ onSubmit, isLoading }) => {
                 ))}
               </div>
             </div>
-
-            {suggestions.length > 0 && (
-              <div className="pt-2">
-                <p className="text-xs text-muted-foreground mb-2">
-                  Popular categories:
-                </p>
-                <div className="flex flex-wrap gap-2">
-                  {suggestions.map((suggestion, index) => (
-                    <span
-                      key={index}
-                      className="text-xs bg-primary/10 text-primary px-2 py-1 rounded"
-                    >
-                      {suggestion}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
 
           <Button type="submit" disabled={isLoading} className="w-full h-12">
