@@ -1,0 +1,9 @@
+.env
+env/
+__pycache__/
+venv/
+experiments/
+backend/vehicle_estimator/yolov8x.pt
+backend/vehicle_estimator/yolo11x.pt
+backend/vehicle_estimator/video.mp4
+backend/vehicle_estimator/output.mp4
