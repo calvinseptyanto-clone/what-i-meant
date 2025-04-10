@@ -1,40 +1,63 @@
 import os
-from flask import Flask, request, jsonify, send_file, send_from_directory
-from openai import OpenAI
+import subprocess
 import json
+import time
+from pathlib import Path
+import shutil
+
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import requests
-import time
 import urllib.request
+from pymongo import MongoClient
+from botocore.exceptions import ClientError
+import oss2
+from openai import OpenAI
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize clients
+# Initialize clients using environment variables
 qwen_client = OpenAI(
-    api_key="sk-2673ab7cbfd84fe0a9fc466b055fdb33",
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
     base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
 )
 
-# OpenAI client for DALL-E image generation
-openai_client = OpenAI(
-    api_key="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"
+# ApsaraDB MongoDB connection for semi-structured data
+mongo_client = MongoClient(os.getenv("MONGODB_CONNECTION_STRING"))
+db = mongo_client[os.getenv("MONGODB_DATABASE", "aphasia_assistant")]
+items_collection = db["items"]
+categories_collection = db["categories"]
+
+# OSS configuration for media storage
+auth = oss2.Auth(
+    os.getenv("OSS_ACCESS_KEY_ID"),
+    os.getenv("OSS_ACCESS_KEY_SECRET")
+)
+bucket = oss2.Bucket(
+    auth,
+    os.getenv("OSS_ENDPOINT"),
+    os.getenv("OSS_BUCKET_NAME")
 )
 
-EAS_URL = "http://quickstart-deploy-20250410-erph.5899343498937115.cn-hongkong.pai-eas.aliyuncs.com/"
-EAS_TOKEN = "YWUxNmI0NGI5NmQyNmE3MWY1NjFiNDhlODhmMDFkYWQ4YjQyMDBkMQ=="
+# Alibaba Cloud EAS configuration for AI model inference
+EAS_URL = os.getenv("EAS_URL")
+EAS_TOKEN = os.getenv("EAS_TOKEN")
 
-# Define paths for data storage
+# Local temporary storage
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-VIDEOS_DIR = os.path.join(os.path.dirname(
-    os.path.abspath(__file__)), 'temp_videos')
-IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'images')
-DATA_FILE = os.path.join(DATA_DIR, 'categorized_data.json')
+TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp')
+VIDEOS_DIR = os.path.join(TEMP_DIR, 'videos')
+IMAGES_DIR = os.path.join(TEMP_DIR, 'images')
 
 # Create directories if they don't exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 os.makedirs(IMAGES_DIR, exist_ok=True)
+
+# Wan2.1 model paths
+WAN_T2I_MODEL_PATH = os.getenv("WAN_T2I_MODEL_PATH", "./Wan2.1-T2V-1.3B")
+WAN_I2V_MODEL_PATH = os.getenv("WAN_I2V_MODEL_PATH", "./Wan2.1-I2V-1.3B-720P")
 
 
 class TaskStatus:
@@ -44,60 +67,153 @@ class TaskStatus:
     FAILED = "failed"
 
 
-def save_data(data):
-    """Save categorized data to JSON file"""
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+def save_data_to_mongodb(data):
+    """Save categorized data to MongoDB"""
+    try:
+        # Store items individually
+        for item in data["items"]:
+            items_collection.update_one(
+                {"name": item["name"]},
+                {"$set": item},
+                upsert=True
+            )
+        return True
+    except Exception as e:
+        print(f"Error saving to MongoDB: {str(e)}")
+        return False
 
 
-def load_data():
-    """Load categorized data from JSON file"""
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error loading data: {str(e)}")
-    return {"items": []}
+def load_data_from_mongodb():
+    """Load categorized data from MongoDB"""
+    try:
+        items = list(items_collection.find({}, {"_id": 0}))
+        return {"items": items}
+    except Exception as e:
+        print(f"Error loading from MongoDB: {str(e)}")
+        return {"items": []}
+
+
+def upload_file_to_oss(local_path, oss_key):
+    """Upload a file to OSS and return public URL"""
+    try:
+        bucket.put_object_from_file(oss_key, local_path)
+        # Generate URL with appropriate expiration
+        url = bucket.sign_url('GET', oss_key, 60 * 60 * 24 * 7)  # 7-day link
+        return url
+    except ClientError as e:
+        print(f"Error uploading to OSS: {str(e)}")
+        return None
 
 
 def generate_and_save_image(prompt, filename):
-    """Generate image using DALL-E and save to disk"""
+    """Generate image using Wan2.1 T2I model and save to OSS"""
     try:
-        # Create a more realistic prompt
+        # Create an enhanced prompt for better image quality
         enhanced_prompt = f"A realistic, high-quality photograph of {prompt}. Professional lighting, detailed texture, photorealistic style. No text, no watermarks."
 
-        # Check if image already exists
-        image_path = os.path.join(IMAGES_DIR, filename)
-        if os.path.exists(image_path):
-            print(f"Image already exists for {prompt}")
-            return filename
+        # Local temporary path
+        local_image_path = os.path.join(IMAGES_DIR, filename)
 
-        print(f"Generating image for: {prompt}")
+        # Check if image already exists in OSS
+        oss_key = f"images/{filename}"
+        try:
+            bucket.get_object_meta(oss_key)
+            print(f"Image already exists in OSS for {prompt}")
+            return oss_key
+        except:
+            # Image doesn't exist, generate it
+            print(f"Generating image for: {prompt}")
 
-        # Generate image using DALL-E 3
-        response = openai_client.images.generate(
-            model="dall-e-3",
-            prompt=enhanced_prompt,
-            size="1024x1024",
-            quality="standard",
-            n=1,
-        )
+            # Run Wan2.1 T2I model
+            cmd = [
+                "python", "generate.py",
+                "--task", "t2i-1.3B",
+                "--size", "1024*1024",
+                "--ckpt_dir", WAN_T2I_MODEL_PATH,
+                "--prompt", enhanced_prompt,
+                "--output", local_image_path
+            ]
 
-        image_url = response.data[0].url
+            process = subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
 
-        # Download and save the image
-        urllib.request.urlretrieve(image_url, image_path)
-
-        print(f"Image generated and saved for {prompt}")
-        return filename
+            if os.path.exists(local_image_path):
+                # Upload to OSS
+                upload_file_to_oss(local_image_path, oss_key)
+                print(f"Image generated and uploaded to OSS for {prompt}")
+                return oss_key
+            else:
+                print(f"Failed to generate image for {prompt}")
+                return None
 
     except Exception as e:
         print(f"Error generating image for {prompt}: {str(e)}")
         return None
 
 
-@app.route('/categorize-items', methods=['POST'])
+def generate_video(item_name, action, video_filename):
+    """Generate video using Wan2.1 I2V model and save to OSS"""
+    try:
+        # First generate a reference image for the item
+        reference_image = os.path.join(
+            IMAGES_DIR, f"{item_name.replace(' ', '_')}_ref.jpg")
+
+        # Generate reference image if it doesn't exist
+        if not os.path.exists(reference_image):
+            # Use simpler T2I command to generate reference image
+            ref_cmd = [
+                "python", "generate.py",
+                "--task", "t2i-1.3B",
+                "--size", "1280*720",
+                "--ckpt_dir", WAN_T2I_MODEL_PATH,
+                "--prompt", f"a clear view of {item_name}",
+                "--output", reference_image
+            ]
+            subprocess.run(ref_cmd, check=True)
+
+        # Local video path
+        local_video_path = os.path.join(VIDEOS_DIR, video_filename)
+
+        # Create prompt with item context
+        prompt = f"A person {action} with {item_name}, realistic, natural movement"
+
+        # Run Wan2.1 I2V model
+        cmd = [
+            "python", "generate.py",
+            "--task", "i2v-1.3B",
+            "--size", "1280*720",
+            "--ckpt_dir", WAN_I2V_MODEL_PATH,
+            "--image", reference_image,
+            "--prompt", prompt,
+            "--output", local_video_path
+        ]
+
+        process = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        # Check if video was created successfully
+        if os.path.exists(local_video_path):
+            # Upload to OSS
+            oss_key = f"videos/{video_filename}"
+            upload_file_to_oss(local_video_path, oss_key)
+            return oss_key
+        else:
+            return None
+
+    except Exception as e:
+        print(f"Error generating video: {str(e)}")
+        return None
+
+
+@app.route('/api/categorize-items', methods=['POST'])
 def categorize_items():
     try:
         # Get items from request
@@ -107,12 +223,12 @@ def categorize_items():
         if not items:
             return jsonify({"error": "No items provided"}), 400
 
-        # Call OpenAI API
+        # Call Qwen for categorization
         completion = qwen_client.chat.completions.create(
             model="qwen-max",
             messages=[
                 {'role': 'system',
-                    'content': 'Generate a JSON structure that categorizes the following items into appropriate categories and subcategories. Each item should also include up to 1 common requests or assistance needs that an aphasia patient might want to communicate to caregivers regarding this item. Each item should be organized in this format:\n{\n  "items": [\n    {\n      "name": "item name",\n      "category": "main category",\n      "subcategory": "specific subcategory",\n      "requests": ["request1"]\n    },\n    ...\n  ]\n}\n\nFor example, if the item is "water", the entry would be:\n{\n  "name": "water",\n  "category": "food and drinks",\n  "subcategory": "beverages",\n  "requests": ["need refill"]\n}\n\nProcess the following items and strictly output in JSON format only without any explanation:'},
+                 'content': 'Generate a JSON structure that categorizes the following items into appropriate categories and subcategories. Each item should also include up to 4 common requests or assistance needs that an aphasia patient might want to communicate to caregivers regarding this item. Each item should be organized in this format:\n{\n  "items": [\n    {\n      "name": "item name",\n      "category": "main category",\n      "subcategory": "specific subcategory",\n      "requests": ["request 1", "request 2", "request 3", "request 4"]\n    },\n    ...\n  ]\n}\n\nFor example, if the item is "water", the entry would be:\n{\n  "name": "water",\n  "category": "food and drinks",\n  "subcategory": "beverages",\n  "requests": ["need refill", "make warmer", "add ice", "help drinking"]\n}\n\nProcess the following items and strictly output in JSON format only without any explanation:'},
                 {'role': 'user', 'content': items}
             ],
             temperature=0
@@ -123,19 +239,19 @@ def categorize_items():
         # Strip the triple backticks and 'json' identifier if present
         if response.startswith("```json"):
             response = response.lstrip("```json").rstrip("```").strip()
+
         elif response.startswith("```"):
             response = response.lstrip("```").rstrip("```").strip()
 
         # Validate it's proper JSON
-        # Validate it's proper JSON
         parsed = json.loads(response)
 
-        # Load existing data
-        existing_data = load_data()
+        # Load existing data from MongoDB
+        existing_data = load_data_from_mongodb()
         existing_items = {
             item["name"]: item for item in existing_data.get("items", [])}
 
-        # Track images and videos
+        # Track OSS paths for images and videos
         image_mapping = {}
         video_mapping = {}
 
@@ -165,10 +281,10 @@ def categorize_items():
 
             # Generate image for the item
             item_image_filename = f"item_{item_name.replace(' ', '_').lower()}.png"
-            item_image = generate_and_save_image(
+            item_image_key = generate_and_save_image(
                 item_name, item_image_filename)
-            if item_image:
-                image_mapping[f"item-{item_name}"] = item_image
+            if item_image_key:
+                image_mapping[f"item-{item_name}"] = item_image_key
 
             # Process requests for videos
             if "requests" in item:
@@ -176,105 +292,39 @@ def categorize_items():
                     # Generate a unique key for this video
                     video_key = f"{item_name}-{action}"
                     video_filename = f"{video_key.replace(' ', '_').replace('-', '_')}.mp4"
-                    video_path = os.path.join(VIDEOS_DIR, video_filename)
 
-                    # Check if video already exists
-                    if os.path.exists(video_path):
-                        print(
-                            f"Video already exists for {item_name} - {action}")
-                        video_mapping[video_key] = video_filename
-                        continue
-
+                    # Check if video exists in OSS
+                    oss_video_key = f"videos/{video_filename}"
                     try:
-                        print(f"Generating video for: {item_name} - {action}")
-
-                        # Create prompt with item context
-                        prompt = f"A person {action} with {item_name}"
-
-                        # Call video generation API
-                        response = requests.post(
-                            f"{EAS_URL}/generate",
-                            headers={"Authorization": f"{EAS_TOKEN}"},
-                            json={
-                                "prompt": prompt,
-                                "seed": 42,
-                                "neg_prompt": "low quality, blurry",
-                                "infer_steps": 50,
-                                "cfg_scale": 7.5,
-                                "height": 480,
-                                "width": 832
-                            }
-                        )
-
-                        if not response.ok:
-                            print(
-                                f"Error initiating video for {video_key}: {response.text}")
-                            continue
-
-                        task_data = response.json()
-                        task_id = task_data.get("task_id")
-
-                        if not task_id:
-                            print(f"No task ID returned for {video_key}")
-                            continue
-
-                        print(f"Task ID: {task_id}")
-
-                        # Poll for completion using while True loop
-                        while True:
-                            status_response = requests.get(
-                                f"{EAS_URL}/tasks/{task_id}/status",
-                                headers={"Authorization": f"{EAS_TOKEN}"}
-                            )
-
-                            if not status_response.ok:
-                                print(
-                                    f"Error checking status for {video_key}: {status_response.text}")
-                                break
-
-                            status = status_response.json()
-                            print(
-                                f"Current status for {item_name} - {action}: {status['status']}")
-
-                            if status["status"] == TaskStatus.COMPLETED:
-                                print(
-                                    f"Video ready for {item_name} - {action}!")
-
-                                # Get the video
-                                video_response = requests.get(
-                                    f"{EAS_URL}/tasks/{task_id}/video",
-                                    headers={"Authorization": f"{EAS_TOKEN}"}
-                                )
-
-                                if video_response.ok:
-                                    # Save the video with a predictable filename
-                                    with open(video_path, "wb") as f:
-                                        f.write(video_response.content)
-
-                                    # Store the filename
-                                    video_mapping[video_key] = video_filename
-                                    print(
-                                        f"Video downloaded successfully for {item_name} - {action}!")
-                                break
-                            elif status["status"] == TaskStatus.FAILED:
-                                print(
-                                    f"Failed: {status.get('error', 'Unknown error')}")
-                                break
-
-                            # Wait before checking again
-                            time.sleep(2)
-
-                    except Exception as e:
+                        bucket.get_object_meta(oss_video_key)
                         print(
-                            f"Error processing video for {video_key}: {str(e)}")
+                            f"Video already exists in OSS for {item_name} - {action}")
+                        video_mapping[video_key] = oss_video_key
+                        continue
+                    except:
+                        # Video doesn't exist, generate it
+                        print(
+                            f"Generating video for: {item_name} - {action}")
+
+                        # Generate the video
+                        video_oss_key = generate_video(
+                            item_name, action, video_filename)
+
+                        if video_oss_key:
+                            video_mapping[video_key] = video_oss_key
+                            print(
+                                f"Video generated and uploaded for {item_name} - {action}")
+                        else:
+                            print(
+                                f"Failed to generate video for {item_name} - {action}")
 
         # Generate images for categories
         for category in categories:
             category_image_filename = f"category_{category.replace(' ', '_').lower()}.png"
-            category_image = generate_and_save_image(
+            category_image_key = generate_and_save_image(
                 category, category_image_filename)
-            if category_image:
-                image_mapping[f"category-{category}"] = category_image
+            if category_image_key:
+                image_mapping[f"category-{category}"] = category_image_key
 
         # Generate images for subcategories
         for subcategory_full in subcategories:
@@ -282,10 +332,10 @@ def categorize_items():
             if len(parts) == 2:
                 category, subcategory = parts
                 subcategory_image_filename = f"subcategory_{category.replace(' ', '_').lower()}_{subcategory.replace(' ', '_').lower()}.png"
-                subcategory_image = generate_and_save_image(
+                subcategory_image_key = generate_and_save_image(
                     f"{subcategory} in {category}", subcategory_image_filename)
-                if subcategory_image:
-                    image_mapping[f"subcategory-{category}-{subcategory}"] = subcategory_image
+                if subcategory_image_key:
+                    image_mapping[f"subcategory-{category}-{subcategory}"] = subcategory_image_key
 
         # Combine existing and new items
         combined_items = list(existing_items.values())
@@ -302,8 +352,8 @@ def categorize_items():
             "images": image_mapping
         }
 
-        # Save the updated data
-        save_data(final_data)
+        # Save the updated data to MongoDB
+        save_data_to_mongodb(final_data)
 
         return jsonify(final_data)
 
@@ -316,25 +366,22 @@ def categorize_items():
 def get_stored_data():
     """Return all stored data"""
     try:
-        data = load_data()
+        data = load_data_from_mongodb()
 
-        # Add video information
-        if "items" in data:
-            video_mapping = {}
-            image_mapping = data.get("images", {})
+        # Get media metadata from MongoDB
+        video_mapping = {}
+        image_mapping = {}
 
-            for item in data["items"]:
-                if "requests" in item:
-                    for action in item["requests"]:
-                        video_key = f"{item['name']}-{action}"
-                        video_filename = f"{video_key.replace(' ', '_').replace('-', '_')}.mp4"
-                        video_path = os.path.join(VIDEOS_DIR, video_filename)
+        # Populate with OSS URLs
+        media_files = media_collection.find({}, {"_id": 0})
+        for media in media_files:
+            if media["type"] == "video":
+                video_mapping[media["key"]] = media["oss_path"]
+            elif media["type"] == "image":
+                image_mapping[media["key"]] = media["oss_path"]
 
-                        if os.path.exists(video_path):
-                            video_mapping[video_key] = video_filename
-
-            data["videos"] = video_mapping
-            data["images"] = image_mapping
+        data["videos"] = video_mapping
+        data["images"] = image_mapping
 
         return jsonify(data)
     except Exception as e:
@@ -345,7 +392,10 @@ def get_stored_data():
 @app.route('/api/videos/<path:filename>', methods=['GET'])
 def get_video(filename):
     try:
-        return send_from_directory(VIDEOS_DIR, filename, mimetype='video/mp4')
+        # Check if file is in OSS and redirect to signed URL
+        oss_key = f"videos/{filename}"
+        url = bucket.sign_url('GET', oss_key, 3600)  # 1-hour link
+        return jsonify({"url": url})
     except Exception as e:
         print(f"Error serving video: {str(e)}")
         return jsonify({"error": str(e)}), 404
@@ -354,7 +404,10 @@ def get_video(filename):
 @app.route('/api/images/<path:filename>', methods=['GET'])
 def get_image(filename):
     try:
-        return send_from_directory(IMAGES_DIR, filename, mimetype='image/png')
+        # Check if file is in OSS and redirect to signed URL
+        oss_key = f"images/{filename}"
+        url = bucket.sign_url('GET', oss_key, 3600)  # 1-hour link
+        return jsonify({"url": url})
     except Exception as e:
         print(f"Error serving image: {str(e)}")
         return jsonify({"error": str(e)}), 404
