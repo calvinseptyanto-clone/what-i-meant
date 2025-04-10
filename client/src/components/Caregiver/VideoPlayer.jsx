@@ -80,6 +80,13 @@ const VideoPlayer = ({ videoKey }) => {
       </div>
     );
   }
+  if (!videoUrl && !error) {
+    return (
+      <div className="w-full h-full flex items-center justify-center bg-gray-100">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
 
   return (
     <video

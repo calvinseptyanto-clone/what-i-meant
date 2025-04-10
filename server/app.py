@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 import shutil
+import base64
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
@@ -468,6 +469,7 @@ def get_stored_data():
         image_mapping = {}
 
         # Populate with OSS URLs
+        media_collection = db["media"]
         media_files = media_collection.find({}, {"_id": 0})
         for media in media_files:
             if media["type"] == "video":
@@ -553,6 +555,116 @@ def generate_speech():
 
     except Exception as e:
         print(f"Error generating speech: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/detect-object', methods=['POST'])
+def detect_object():
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+
+        image_file = request.files['image']
+
+        # Save the image temporarily
+        temp_image_path = os.path.join(TEMP_DIR, 'temp_image.jpg')
+        image_file.save(temp_image_path)
+
+        # Encode the image to base64 for Qwen-VL
+        with open(temp_image_path, "rb") as image_file:
+            encoded_string = base64.b64encode(
+                image_file.read()).decode('utf-8')
+
+        # Call Qwen-VL for object detection
+        completion = qwen_client.chat.completions.create(
+            model="qwen-vl",
+            messages=[
+                {'role': 'system', 'content': 'You are an AI assistant capable of analyzing images. Detect the main object in the image and provide its name as a single word or short phrase. No explanations.'},
+                {'role': 'user', 'content': [
+                    {'type': 'text', 'text': 'What is the main object in this image?'},
+                    {'type': 'image_url', 'image_url': {
+                        'url': f"data:image/jpeg;base64,{encoded_string}"}}
+                ]}
+            ],
+            temperature=0
+        )
+
+        detected_object = completion.choices[0].message.content.strip()
+
+        # Clean up temporary file
+        os.remove(temp_image_path)
+
+        return jsonify({"detected_item": detected_object})
+
+    except Exception as e:
+        print(f"Error detecting object: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/update-item-requests', methods=['POST'])
+def update_item_requests():
+    try:
+        data = request.json
+        item_name = data.get('itemName')
+        requests = data.get('requests')
+        video_path = data.get('videoPath')
+
+        if not item_name or not requests:
+            return jsonify({"error": "Invalid request data"}), 400
+
+        # Update the item in MongoDB
+        result = items_collection.update_one(
+            {"name": item_name},
+            {"$set": {"requests": requests}}
+        )
+
+        # Update media collection for the new video
+        if video_path:
+            # The last request is the new one
+            video_key = f"{item_name}-{requests[-1]}"
+            media_collection.update_one(
+                {"key": video_key},
+                {"$set": {
+                    "type": "video",
+                    "key": video_key,
+                    "oss_path": video_path
+                }},
+                upsert=True
+            )
+
+        return jsonify({"success": True})
+
+    except Exception as e:
+        print(f"Error updating item requests: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/generate-action-video', methods=['POST'])
+def generate_action_video():
+    try:
+        data = request.json
+        item_name = data.get('itemName')
+        action = data.get('action')
+
+        if not item_name or not action:
+            return jsonify({"error": "Invalid request data"}), 400
+
+        # Generate a unique filename
+        video_filename = f"{item_name.replace(' ', '_')}_{action.replace(' ', '_')}.mp4"
+
+        # Generate the video
+        video_path = generate_video(item_name, action, video_filename)
+
+        if not video_path:
+            return jsonify({"error": "Failed to generate video"}), 500
+
+        return jsonify({
+            "success": True,
+            "videoPath": video_path
+        })
+
+    except Exception as e:
+        print(f"Error generating action video: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 
