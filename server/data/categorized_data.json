@@ -1,0 +1,20 @@
+{
+  "items": [
+    {
+      "name": "bread",
+      "category": "food and drinks",
+      "subcategory": "baked goods",
+      "requests": [
+        "need a slice"
+      ]
+    }
+  ],
+  "videos": {
+    "bread-need a slice": "bread_need_a_slice.mp4"
+  },
+  "images": {
+    "item-bread": "item_bread.png",
+    "category-food and drinks": "category_food_and_drinks.png",
+    "subcategory-food and drinks-baked goods": "subcategory_food_and_drinks_baked_goods.png"
+  }
+}
